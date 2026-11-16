@@ -272,7 +272,10 @@ pub fn app_with_backend_settings(
     let transcriptions = features
         .transcriptions_api
         .then(|| Arc::new(CodexTranscriptionBackend::new()));
-    let backends = Arc::new(BackendSelector::new(settings.order));
+    let backends = Arc::new(BackendSelector::with_failover(
+        settings.order,
+        settings.failover,
+    ));
     let state = Arc::new(AppState {
         registry,
         monitor,
@@ -1640,17 +1643,70 @@ async fn dispatch_request(
         }
     };
 
-    if !count_tokens && state.backends.snapshot().current == Backend::Claude {
-        let response = backend::forward_messages(
-            &state.claude,
-            &req_id,
-            body.model.as_deref(),
-            &headers,
-            uri.query(),
-            body_bytes,
-        )
-        .await;
-        if let Some(session_id) = session_id.as_deref() {
+    if let Some(switch) = state.backends.retry_codex_if_due() {
+        create_logger("backend").info(
+            "backend switched",
+            Some(Map::from_iter([
+                ("backend".to_string(), json!(switch.current.as_str())),
+                ("reason".to_string(), json!("retry_codex")),
+            ])),
+        );
+    }
+    let session_allowed = state.backends.allowed_for(session_id.as_deref());
+    let current_backend = state.backends.snapshot().current;
+    // Messages follow the global backend. A count_tokens request also goes to
+    // Claude when the session may use only Claude, since counting never reaches
+    // a generation backend.
+    let claude_route = if count_tokens {
+        current_backend == Backend::Claude || !session_allowed.contains(&Backend::Codex)
+    } else {
+        current_backend == Backend::Claude
+    };
+    if claude_route {
+        if !session_allowed.contains(&Backend::Claude) {
+            let model = body.model.as_deref().unwrap_or("(none)");
+            log.warn(
+                "backend not allowed for session",
+                Some(Map::from_iter([
+                    ("reqId".to_string(), json!(&req_id)),
+                    ("backend".to_string(), json!("claude")),
+                ])),
+            );
+            monitor_failed(
+                state.monitor.as_ref(),
+                &req_id,
+                Some(StatusCode::CONFLICT),
+                backend_not_allowed_message(model, Backend::Claude),
+            );
+            return with_request_id(
+                backend_not_allowed_response(model, Backend::Claude),
+                &req_id,
+            );
+        }
+        // The Claude path forwards the body bytes and the `model` field as the
+        // client sent them. The skipped steps are listed on `forward_messages`.
+        let response = if count_tokens {
+            backend::forward_count_tokens(
+                &state.claude,
+                &req_id,
+                body.model.as_deref(),
+                &headers,
+                uri.query(),
+                body_bytes,
+            )
+            .await
+        } else {
+            backend::forward_messages(
+                &state.claude,
+                &req_id,
+                body.model.as_deref(),
+                &headers,
+                uri.query(),
+                body_bytes,
+            )
+            .await
+        };
+        if !count_tokens && let Some(session_id) = session_id.as_deref() {
             state
                 .backends
                 .record_session(session_id, Backend::Claude, body.model.as_deref());
@@ -1841,6 +1897,39 @@ async fn dispatch_request(
         }
     };
 
+    // Codex-path guard: a session that may not use Codex is refused rather than
+    // served by Codex, whatever the model (a Claude model is the case that
+    // matters: it must not be downgraded to Codex).
+    if !session_allowed.contains(&Backend::Codex) {
+        log.warn(
+            "backend not allowed for session",
+            Some(Map::from_iter([
+                ("reqId".to_string(), json!(&req_id)),
+                ("backend".to_string(), json!("codex")),
+                ("model".to_string(), json!(&normalized_model)),
+            ])),
+        );
+        let response = backend_not_allowed_response(&normalized_model, Backend::Codex);
+        log_request_completed(
+            &log,
+            RequestLogContext {
+                req_id: &req_id,
+                provider: Some(provider.name()),
+                model: Some(&normalized_model),
+                count_tokens,
+                status: response.status(),
+                started_at,
+            },
+        );
+        monitor_failed(
+            state.monitor.as_ref(),
+            &req_id,
+            Some(response.status()),
+            backend_not_allowed_message(&normalized_model, Backend::Codex),
+        );
+        return with_request_id(response, &req_id);
+    }
+
     body.bypass_provider_model_override = auto_review_route.is_some() && provider.name() == "codex";
 
     if let Some(route) = auto_review_route.as_ref() {
@@ -1968,9 +2057,11 @@ async fn dispatch_request(
             .get(http::header::RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
+        // With failover off, or a session that may not use Claude, the 429 is
+        // returned to the client unchanged below.
         if state
             .backends
-            .fail_over_on_429(retry_after.clone())
+            .fail_over_on_429(retry_after.clone(), &session_allowed)
             .is_some()
         {
             log.warn(
@@ -2032,6 +2123,21 @@ async fn dispatch_request(
         );
     }
     with_request_id(response, &req_id)
+}
+
+fn backend_not_allowed_message(model: &str, backend: Backend) -> String {
+    format!(
+        "Model \"{model}\" cannot be served by {}: backend not allowed for this session",
+        backend.as_str()
+    )
+}
+
+fn backend_not_allowed_response(model: &str, backend: Backend) -> Response {
+    json_error(
+        StatusCode::CONFLICT,
+        "permission_error",
+        backend_not_allowed_message(model, backend),
+    )
 }
 
 /// Streamed Claude responses skip the error capture that Codex failures get,

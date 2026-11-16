@@ -46,6 +46,10 @@ struct FileConfig {
     pub grok: Option<GrokConfig>,
     pub opencode: Option<OpenCodeConfig>,
     pub backends: Option<Vec<String>>,
+    /// Raw JSON so a wrongly typed value is rejected at startup instead of
+    /// dropping the whole file.
+    pub failover_on_429: Option<serde_json::Value>,
+    pub retry_codex_after_secs: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -220,6 +224,20 @@ fn load_config_from_env(env: &HashMap<String, String>, config_dir: PathBuf) -> L
 /// Backend order from the `backends` key of `config.json` in `config_dir`.
 pub fn file_backends_in(config_dir: &Path) -> Option<Vec<String>> {
     read_file_config(config_dir).and_then(|file| file.backends)
+}
+
+/// Raw failover values from `config.json` in `config_dir`.
+pub struct FileFailover {
+    pub failover_on_429: Option<serde_json::Value>,
+    pub retry_codex_after_secs: Option<serde_json::Value>,
+}
+
+pub fn file_failover_in(config_dir: &Path) -> FileFailover {
+    let file = read_file_config(config_dir);
+    FileFailover {
+        failover_on_429: file.as_ref().and_then(|file| file.failover_on_429.clone()),
+        retry_codex_after_secs: file.and_then(|file| file.retry_codex_after_secs),
+    }
 }
 
 pub fn config_path() -> PathBuf {
