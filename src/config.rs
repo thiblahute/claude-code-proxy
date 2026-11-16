@@ -45,6 +45,7 @@ struct FileConfig {
     pub cursor: Option<CursorConfig>,
     pub grok: Option<GrokConfig>,
     pub opencode: Option<OpenCodeConfig>,
+    pub backends: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -214,6 +215,11 @@ fn load_config_from_env(env: &HashMap<String, String>, config_dir: PathBuf) -> L
     }
 
     out
+}
+
+/// Backend order from the `backends` key of `config.json` in `config_dir`.
+pub fn file_backends_in(config_dir: &Path) -> Option<Vec<String>> {
+    read_file_config(config_dir).and_then(|file| file.backends)
 }
 
 pub fn config_path() -> PathBuf {

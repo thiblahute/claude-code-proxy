@@ -1,5 +1,6 @@
 use crate::{
     anthropic::{MAX_ANTHROPIC_REQUEST_BYTES, json_error},
+    backend::{self, Backend, BackendSelector, BackendSettings, ClaudeUpstream},
     logging::{Logger, REDACT_KEYS, create_logger},
     monitor::{EndpointKind, MonitorHandle},
     openai_compat::{
@@ -34,6 +35,7 @@ use axum::{
     body::Body,
     extract::{DefaultBodyLimit, FromRequest, Multipart, Query, State},
     http::{Request, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -147,6 +149,8 @@ pub async fn serve_listener(
     monitor: Option<MonitorHandle>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    // Reject a bad CCP_BACKENDS or CCP_CLAUDE_BASE_URL before serving anything.
+    backend::load_settings().map_err(anyhow::Error::msg)?;
     let local_addr = listener.local_addr()?;
     let port = local_addr.port();
     create_logger("server").info(
@@ -229,6 +233,22 @@ pub fn app_with_features(
     monitor: Option<MonitorHandle>,
     features: AppFeatures,
 ) -> Router {
+    let settings = backend::load_settings().unwrap_or_else(|error| {
+        create_logger("server").warn(
+            "backend settings rejected; using codex only",
+            Some(Map::from_iter([("error".to_string(), json!(error))])),
+        );
+        BackendSettings::defaults()
+    });
+    app_with_backend_settings(registry, monitor, features, settings)
+}
+
+pub fn app_with_backend_settings(
+    registry: Arc<Registry>,
+    monitor: Option<MonitorHandle>,
+    features: AppFeatures,
+    settings: BackendSettings,
+) -> Router {
     let native_responses = features
         .responses_api
         .then(|| Arc::new(CodexNativeBackend::new()));
@@ -252,6 +272,7 @@ pub fn app_with_features(
     let transcriptions = features
         .transcriptions_api
         .then(|| Arc::new(CodexTranscriptionBackend::new()));
+    let backends = Arc::new(BackendSelector::new(settings.order));
     let state = Arc::new(AppState {
         registry,
         monitor,
@@ -259,6 +280,8 @@ pub fn app_with_features(
         chat_completions,
         images,
         transcriptions,
+        backends: backends.clone(),
+        claude: Arc::new(settings.upstream),
     });
     let router = Router::new()
         .route("/healthz", get(healthz))
@@ -292,7 +315,87 @@ pub fn app_with_features(
     } else {
         router
     };
-    router.fallback(fallback_handler).with_state(state)
+    router
+        .fallback(fallback_handler)
+        .with_state(state)
+        .merge(backend::control_router(backends))
+        .layer(middleware::from_fn(request_guard))
+}
+
+/// Hosts a local client may address the proxy by. Any other Host header means
+/// the request was addressed to a name that a DNS rebinding page controls.
+const ALLOWED_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
+
+/// Multipart routes accept `multipart/form-data` on top of JSON.
+const MULTIPART_ROUTES: [&str; 2] = ["/v1/audio/transcriptions", "/v1/images/edits"];
+
+/// Browser-abuse guard for `/v1/*`, `/control/*` and `/monitor`. A web page can
+/// make the browser reach loopback, so requests must name a local host. The
+/// API and control routes also reject any `Origin` header and expect a body
+/// type they understand. `/monitor` only gets the Host check.
+async fn request_guard(request: Request<Body>, next: Next) -> Response {
+    let path = request.uri().path();
+    let is_v1 = path.starts_with("/v1/");
+    let is_control = path.starts_with("/control/");
+    let is_monitor = path == "/monitor";
+    if !is_v1 && !is_control && !is_monitor {
+        return next.run(request).await;
+    }
+    let headers = request.headers();
+    if !headers.get_all(http::header::HOST).iter().all(host_allowed) {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            "Host not allowed",
+        );
+    }
+    if is_monitor {
+        return next.run(request).await;
+    }
+    if headers.contains_key(http::header::ORIGIN) {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            "Origin not allowed",
+        );
+    }
+    if is_v1 && request.method() == http::Method::POST {
+        let mut accepted = vec!["application/json"];
+        if MULTIPART_ROUTES.contains(&path) {
+            accepted.push("multipart/form-data");
+        }
+        let media_type = headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|raw| raw.split(';').next())
+            .map(|media_type| media_type.trim().to_ascii_lowercase());
+        if !media_type.is_some_and(|media_type| accepted.contains(&media_type.as_str())) {
+            return json_error(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "invalid_request_error",
+                "Content-Type must be application/json",
+            );
+        }
+    }
+    next.run(request).await
+}
+
+/// Checks one Host header value. The port is dropped first, and IPv6 literals
+/// are compared without their brackets.
+fn host_allowed(value: &http::HeaderValue) -> bool {
+    let Ok(raw) = value.to_str() else {
+        return false;
+    };
+    let host = if let Some(bracketed) = raw.strip_prefix('[') {
+        bracketed.split_once(']').map_or("", |(host, _)| host)
+    } else if raw.matches(':').count() == 1 {
+        raw.split_once(':').map_or(raw, |(host, _)| host)
+    } else {
+        raw
+    };
+    ALLOWED_HOSTS
+        .iter()
+        .any(|allowed| host.eq_ignore_ascii_case(allowed))
 }
 
 #[derive(Clone)]
@@ -303,6 +406,8 @@ struct AppState {
     chat_completions: Option<Arc<ChatCompletionsBackend>>,
     images: Option<Arc<CodexImagesBackend>>,
     transcriptions: Option<Arc<CodexTranscriptionBackend>>,
+    backends: Arc<BackendSelector>,
+    claude: Arc<ClaudeUpstream>,
 }
 
 async fn handler_monitor(
@@ -1535,6 +1640,25 @@ async fn dispatch_request(
         }
     };
 
+    if !count_tokens && state.backends.snapshot().current == Backend::Claude {
+        let response = backend::forward_messages(
+            &state.claude,
+            &req_id,
+            body.model.as_deref(),
+            &headers,
+            uri.query(),
+            body_bytes,
+        )
+        .await;
+        if let Some(session_id) = session_id.as_deref() {
+            state
+                .backends
+                .record_session(session_id, Backend::Claude, body.model.as_deref());
+        }
+        return finish_claude_response(&state, &req_id, request_guard, response);
+    }
+    let raw_model = body.model.clone();
+
     if let Some(thread) = body.extra.remove("thread")
         && thread.get("type").and_then(Value::as_str) != Some("create")
     {
@@ -1792,9 +1916,17 @@ async fn dispatch_request(
         );
     }
 
+    if let Some(session_id) = session_id.as_deref()
+        && !count_tokens
+    {
+        state
+            .backends
+            .record_session(session_id, Backend::Codex, raw_model.as_deref());
+    }
+
     let context = RequestContext {
         req_id: req_id.clone(),
-        session_id,
+        session_id: session_id.clone(),
         session_seq: current.map(|s| s.seq),
         provider: provider.name().to_string(),
         traffic,
@@ -1827,6 +1959,46 @@ async fn dispatch_request(
             started_at,
         },
     );
+    if !count_tokens
+        && response.status() == StatusCode::TOO_MANY_REQUESTS
+        && backend::has_passthrough_credentials(&headers)
+    {
+        let retry_after = response
+            .headers()
+            .get(http::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        if state
+            .backends
+            .fail_over_on_429(retry_after.clone())
+            .is_some()
+        {
+            log.warn(
+                "codex rate limited; failing over to claude",
+                Some(Map::from_iter([
+                    ("reqId".to_string(), json!(&req_id)),
+                    ("retryAfter".to_string(), json!(&retry_after)),
+                ])),
+            );
+            drop(response);
+            let response = backend::forward_messages(
+                &state.claude,
+                &req_id,
+                raw_model.as_deref(),
+                &headers,
+                uri.query(),
+                body_bytes,
+            )
+            .await;
+            if let Some(session_id) = session_id.as_deref() {
+                state
+                    .backends
+                    .record_session(session_id, Backend::Claude, raw_model.as_deref());
+            }
+            return finish_claude_response(&state, &req_id, request_guard, response);
+        }
+    }
+
     let status = response.status();
     if status.is_success() {
         return monitor_response_body(response, request_guard);
@@ -1860,6 +2032,27 @@ async fn dispatch_request(
         );
     }
     with_request_id(response, &req_id)
+}
+
+/// Streamed Claude responses skip the error capture that Codex failures get,
+/// because their bodies are passed through as they arrive.
+fn finish_claude_response(
+    state: &AppState,
+    req_id: &str,
+    guard: RequestMonitorGuard,
+    response: Response,
+) -> Response {
+    let status = response.status();
+    if status.is_success() {
+        return monitor_response_body(response, guard);
+    }
+    monitor_failed(
+        state.monitor.as_ref(),
+        req_id,
+        Some(status),
+        format!("HTTP {}", status.as_u16()),
+    );
+    with_request_id(response, req_id)
 }
 
 /// Header Claude Code reads to populate the `requestId` field it writes into

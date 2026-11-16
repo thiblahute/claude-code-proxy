@@ -493,6 +493,7 @@ async fn invalid_json_request_is_json_error() {
             Request::builder()
                 .method(Method::POST)
                 .uri("/v1/messages")
+                .header("content-type", "application/json")
                 .body(body_string("{"))
                 .unwrap(),
         )
@@ -695,6 +696,7 @@ async fn empty_body_is_invalid_json() {
             Request::builder()
                 .method(Method::POST)
                 .uri("/v1/messages")
+                .header("content-type", "application/json")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1028,6 +1030,7 @@ async fn image_routes_reject_variations_wrong_media_and_oversized_generation() {
             Request::builder()
                 .method(Method::POST)
                 .uri("/v1/images/variations")
+                .header("content-type", "application/json")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1207,6 +1210,7 @@ async fn transcription_route_is_independently_opt_in_and_validates_multipart() {
             Request::builder()
                 .method(Method::POST)
                 .uri("/v1/audio/transcriptions")
+                .header("content-type", "application/json")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1666,6 +1670,7 @@ async fn monitor_records_invalid_json_failure() {
             Request::builder()
                 .method(Method::POST)
                 .uri("/v1/messages")
+                .header("content-type", "application/json")
                 .body(body_string("{"))
                 .unwrap(),
         )
