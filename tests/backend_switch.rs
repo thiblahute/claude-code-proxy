@@ -1109,3 +1109,56 @@ async fn manual_switch_is_refused_when_a_session_may_not_use_the_target() {
     .await;
     assert_eq!(state["current"], "codex");
 }
+
+/// Loopback stand-in for api.anthropic.com that answers every request with
+/// a rate-limit 429 carrying Anthropic's limit headers.
+async fn start_rate_limited_mock() -> String {
+    let mock = Router::new().fallback(|| async {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                (header::RETRY_AFTER, "42"),
+                (
+                    header::HeaderName::from_static("anthropic-ratelimit-unified-status"),
+                    "rejected",
+                ),
+                (
+                    header::HeaderName::from_static("anthropic-ratelimit-unified-reset"),
+                    "1795000000",
+                ),
+                (header::SET_COOKIE, "upstream=1"),
+            ],
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"limited"}}"#,
+        )
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    base
+}
+
+#[tokio::test]
+async fn claude_passthrough_returns_rate_limit_headers_verbatim() {
+    let base = start_rate_limited_mock().await;
+    let router = app(vec![Backend::Claude], StatusCode::OK, Some(&base));
+
+    let response = router
+        .oneshot(messages_request(&[("authorization", "Bearer test-token")]))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let headers = response.headers().clone();
+    assert_eq!(headers.get(header::RETRY_AFTER).unwrap(), "42");
+    assert_eq!(
+        headers.get("anthropic-ratelimit-unified-status").unwrap(),
+        "rejected"
+    );
+    assert_eq!(
+        headers.get("anthropic-ratelimit-unified-reset").unwrap(),
+        "1795000000"
+    );
+    assert!(headers.get(header::SET_COOKIE).is_none());
+    assert!(body_text(response).await.contains("rate_limit_error"));
+}

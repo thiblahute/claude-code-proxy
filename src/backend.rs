@@ -1065,6 +1065,10 @@ pub async fn forward(
         .headers()
         .get(header::CONTENT_TYPE)
         .cloned();
+    // Claude Code and clauth read limits from these headers (retry-after,
+    // anthropic-ratelimit-*), so pass them through rather than only the
+    // content type.
+    let passed_headers = response_headers_to_pass(upstream_response.headers());
     let mut summary = PassthroughSummary {
         log: create_logger("backend"),
         req_id: request.req_id.to_string(),
@@ -1119,12 +1123,33 @@ pub async fn forward(
     };
     let mut response = Response::new(body);
     *response.status_mut() = status;
-    if let Some(content_type) = content_type {
-        response
-            .headers_mut()
-            .insert(header::CONTENT_TYPE, content_type);
-    }
+    response.headers_mut().extend(passed_headers);
     response
+}
+
+/// Upstream response headers to hand back to the client: everything except
+/// hop-by-hop headers, `content-length` (the body may be rewritten or
+/// streamed) and `set-cookie` (no upstream gets to set cookies on the client).
+fn response_headers_to_pass(upstream: &HeaderMap) -> HeaderMap {
+    const DROPPED: &[&str] = &[
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "content-length",
+        "set-cookie",
+    ];
+    let mut passed = HeaderMap::new();
+    for (name, value) in upstream {
+        if !DROPPED.contains(&name.as_str()) {
+            passed.append(name.clone(), value.clone());
+        }
+    }
+    passed
 }
 
 /// Streams the upstream body through, counting bytes for the summary line.
