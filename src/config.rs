@@ -50,6 +50,8 @@ struct FileConfig {
     /// dropping the whole file.
     pub failover_on_429: Option<serde_json::Value>,
     pub retry_codex_after_secs: Option<serde_json::Value>,
+    /// Named Anthropic-compatible upstreams, validated by `upstream::load`.
+    pub upstreams: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -238,6 +240,11 @@ pub fn file_failover_in(config_dir: &Path) -> FileFailover {
         failover_on_429: file.as_ref().and_then(|file| file.failover_on_429.clone()),
         retry_codex_after_secs: file.and_then(|file| file.retry_codex_after_secs),
     }
+}
+
+/// Raw `upstreams` value from `config.json` in `config_dir`.
+pub fn file_upstreams_in(config_dir: &Path) -> Option<serde_json::Value> {
+    read_file_config(config_dir).and_then(|file| file.upstreams)
 }
 
 pub fn config_path() -> PathBuf {

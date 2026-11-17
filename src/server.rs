@@ -29,6 +29,7 @@ use crate::{
     request_identity::{CLAUDE_AGENT_HEADER, CLAUDE_PARENT_AGENT_HEADER, ConversationIdentity},
     session::{self, SessionState},
     traffic::{TrafficCaptureOptions, create_traffic_capture},
+    upstream::{UpstreamRoute, Upstreams},
 };
 use axum::{
     Json, Router,
@@ -272,10 +273,12 @@ pub fn app_with_backend_settings(
     let transcriptions = features
         .transcriptions_api
         .then(|| Arc::new(CodexTranscriptionBackend::new()));
-    let backends = Arc::new(BackendSelector::with_failover(
+    let backends = Arc::new(BackendSelector::with_upstreams(
         settings.order,
         settings.failover,
+        settings.upstreams.names(),
     ));
+    settings.upstreams.spawn_discovery();
     let state = Arc::new(AppState {
         registry,
         monitor,
@@ -285,6 +288,7 @@ pub fn app_with_backend_settings(
         transcriptions,
         backends: backends.clone(),
         claude: Arc::new(settings.upstream),
+        upstreams: settings.upstreams,
     });
     let router = Router::new()
         .route("/healthz", get(healthz))
@@ -411,6 +415,7 @@ struct AppState {
     transcriptions: Option<Arc<CodexTranscriptionBackend>>,
     backends: Arc<BackendSelector>,
     claude: Arc<ClaudeUpstream>,
+    upstreams: Upstreams,
 }
 
 async fn handler_monitor(
@@ -461,6 +466,9 @@ struct ModelsQuery {
 /// Claude Code only adds entries whose id starts with `claude` or `anthropic`,
 /// so the Anthropic-style aliases are what surface in its `/model` picker;
 /// raw provider ids are still listed for other Anthropic-compatible clients.
+/// Named upstreams follow: `<upstream>/<model>` for every model they serve, and
+/// the bare name when it routes to that upstream. Discovered lists are
+/// refreshed here, lazily, at most once per discovery interval.
 async fn handler_models(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ModelsQuery>,
@@ -478,6 +486,23 @@ async fn handler_models(
             })
         })
         .collect();
+    if !state.upstreams.is_empty() {
+        state.upstreams.refresh_stale().await;
+        data.extend(
+            state
+                .upstreams
+                .model_entries(|model| claimed_by_provider(&state.registry, model))
+                .into_iter()
+                .map(|(model, upstream)| {
+                    json!({
+                        "type": "model",
+                        "object": "model",
+                        "id": model,
+                        "display_name": format!("{model} ({upstream})"),
+                    })
+                }),
+        );
+    }
     let has_more = query.limit.is_some_and(|limit| data.len() > limit);
     if let Some(limit) = query.limit {
         data.truncate(limit);
@@ -1653,6 +1678,30 @@ async fn dispatch_request(
         );
     }
     let session_allowed = state.backends.allowed_for(session_id.as_deref());
+    // Named upstreams come first: their models never reach the selector or
+    // the registry.
+    if let Some(route) = body.model.as_deref().and_then(|model| {
+        state
+            .upstreams
+            .route(model, |model| claimed_by_provider(&state.registry, model))
+    }) {
+        return dispatch_upstream(
+            &state,
+            UpstreamDispatch {
+                route,
+                req_id: &req_id,
+                session_id: session_id.as_deref(),
+                session_allowed: &session_allowed,
+                requested_model: body.model.as_deref().unwrap_or_default(),
+                headers: &headers,
+                query: uri.query(),
+                body: body_bytes,
+                count_tokens,
+            },
+            request_guard,
+        )
+        .await;
+    }
     let current_backend = state.backends.snapshot().current;
     // Messages follow the global backend. A count_tokens request also goes to
     // Claude when the session may use only Claude, since counting never reaches
@@ -2123,6 +2172,109 @@ async fn dispatch_request(
         );
     }
     with_request_id(response, &req_id)
+}
+
+/// True when a built-in provider serves the bare `model`; such a name never
+/// routes to a named upstream without its `<upstream>/` prefix.
+fn claimed_by_provider(registry: &Registry, model: &str) -> bool {
+    registry
+        .provider_for_model(&normalize_incoming_model(model), None)
+        .is_some()
+}
+
+struct UpstreamDispatch<'a> {
+    route: UpstreamRoute,
+    req_id: &'a str,
+    session_id: Option<&'a str>,
+    session_allowed: &'a [Backend],
+    requested_model: &'a str,
+    headers: &'a http::HeaderMap,
+    query: Option<&'a str>,
+    body: axum::body::Bytes,
+    count_tokens: bool,
+}
+
+/// Forwards a request routed to a named upstream. Like the Claude passthrough
+/// the body goes out as sent, except that a `<upstream>/` prefix is removed
+/// from `model` (the JSON is re-serialized for that, see
+/// `upstream::rewrite_model_field`) and put back in the response. No Codex
+/// failover and no Claude-model downgrade guard apply here.
+async fn dispatch_upstream(
+    state: &AppState,
+    request: UpstreamDispatch<'_>,
+    guard: RequestMonitorGuard,
+) -> Response {
+    let upstream = request.route.upstream;
+    let backend = upstream.backend();
+    let requested_model = request.requested_model;
+    if !request.session_allowed.contains(&backend) {
+        create_logger("server").warn(
+            "backend not allowed for session",
+            Some(Map::from_iter([
+                ("reqId".to_string(), json!(request.req_id)),
+                ("backend".to_string(), json!(backend.as_str())),
+            ])),
+        );
+        monitor_failed(
+            state.monitor.as_ref(),
+            request.req_id,
+            Some(StatusCode::CONFLICT),
+            backend_not_allowed_message(requested_model, backend.clone()),
+        );
+        return with_request_id(
+            backend_not_allowed_response(requested_model, backend),
+            request.req_id,
+        );
+    }
+    let (body, sent_model, restore_model) = match request.route.forwarded_model {
+        Some(model) => match crate::upstream::rewrite_model_field(&request.body, &model) {
+            Some(body) => (body, model, Some(requested_model.to_string())),
+            None => {
+                let response = json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "Request body must be a JSON object",
+                );
+                monitor_failed(
+                    state.monitor.as_ref(),
+                    request.req_id,
+                    Some(response.status()),
+                    "Request body must be a JSON object",
+                );
+                return with_request_id(response, request.req_id);
+            }
+        },
+        None => (request.body, requested_model.to_string(), None),
+    };
+    if let Some(monitor) = state.monitor.as_ref() {
+        monitor.provider_selected(
+            request.req_id,
+            upstream.name().to_string(),
+            &sent_model,
+            None,
+        );
+    }
+    let response = backend::forward(
+        upstream.http(),
+        request.count_tokens,
+        backend::ForwardRequest {
+            req_id: request.req_id,
+            model: Some(&sent_model),
+            headers: request.headers,
+            query: request.query,
+            body,
+            restore_model,
+        },
+    )
+    .await;
+    if !request.count_tokens
+        && let Some(session_id) = request.session_id
+    {
+        state
+            .backends
+            .record_session(session_id, backend, Some(requested_model));
+    }
+    finish_claude_response(state, request.req_id, guard, response)
 }
 
 fn backend_not_allowed_message(model: &str, backend: Backend) -> String {

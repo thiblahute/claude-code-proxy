@@ -7,6 +7,10 @@
 //! 429 before any body byte has been sent. Each session may be restricted to a
 //! subset of the configured backends, so a session never silently moves to a
 //! backend it is not allowed to use.
+//!
+//! Named Anthropic-compatible upstreams (`crate::upstream`) are routed by the
+//! request's model rather than by the selector; they appear here as
+//! `Backend::Upstream` so session records and allowed lists can name them.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -56,17 +60,23 @@ const FORWARDED_HEADERS: &[&str] = &[
 ];
 const FORWARDED_HEADER_PREFIX: &str = "x-stainless-";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A backend that can answer `/v1/messages`. `Codex` and `Claude` are the
+/// selector's choices; `Upstream` is a named Anthropic-compatible upstream from
+/// the `upstreams` config, only reached by model routing. Each serializes as its
+/// name, so the JSON for `codex` and `claude` is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Backend {
     Codex,
     Claude,
+    Upstream(Arc<str>),
 }
 
 impl Backend {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Backend::Codex => "codex",
             Backend::Claude => "claude",
+            Backend::Upstream(name) => name,
         }
     }
 }
@@ -111,23 +121,23 @@ impl BackendOrder {
     }
 
     pub fn first(&self) -> Backend {
-        self.0[0]
+        self.0[0].clone()
     }
 
-    pub fn contains(&self, backend: Backend) -> bool {
-        self.0.contains(&backend)
+    pub fn contains(&self, backend: &Backend) -> bool {
+        self.0.contains(backend)
     }
 
     pub fn backends(&self) -> Vec<Backend> {
         self.0.clone()
     }
 
-    pub fn names(&self) -> Vec<&'static str> {
+    pub fn names(&self) -> Vec<&str> {
         names_of(&self.0)
     }
 }
 
-fn names_of(backends: &[Backend]) -> Vec<&'static str> {
+fn names_of(backends: &[Backend]) -> Vec<&str> {
     backends.iter().map(|backend| backend.as_str()).collect()
 }
 
@@ -309,19 +319,19 @@ pub fn manual_switch(
     target: Backend,
     now: &str,
 ) -> Result<SelectorState, String> {
-    if !order.contains(target) {
+    if !order.contains(&target) {
         return Err(format!(
             "backend \"{}\" is not in the configured order",
             target.as_str()
         ));
     }
     Ok(SelectorState {
-        current: target,
         since: if target == state.current {
             state.since.clone()
         } else {
             now.to_string()
         },
+        current: target,
         last_switch_reason: SwitchReason::Manual,
         next_check: None,
     })
@@ -337,7 +347,7 @@ pub fn rate_limit_failover(
     now: &str,
     retry_codex_after_secs: Option<u64>,
 ) -> Option<SelectorState> {
-    if state.current != Backend::Codex || !order.contains(Backend::Claude) {
+    if state.current != Backend::Codex || !order.contains(&Backend::Claude) {
         return None;
     }
     Some(SelectorState {
@@ -360,7 +370,7 @@ pub fn codex_retry_due(
 ) -> Option<SelectorState> {
     if state.current != Backend::Claude
         || !matches!(state.last_switch_reason, SwitchReason::RateLimit429 { .. })
-        || !order.contains(Backend::Codex)
+        || !order.contains(&Backend::Codex)
     {
         return None;
     }
@@ -457,6 +467,8 @@ impl SessionBook {
 /// Runtime selector shared by every request handled by one app instance.
 pub struct BackendSelector {
     order: BackendOrder,
+    /// Names of the configured upstreams, as `Backend::Upstream`.
+    upstreams: Vec<Backend>,
     failover: FailoverPolicy,
     state: Mutex<SelectorState>,
     sessions: Mutex<SessionBook>,
@@ -468,9 +480,20 @@ impl BackendSelector {
     }
 
     pub fn with_failover(order: BackendOrder, failover: FailoverPolicy) -> Self {
+        Self::with_upstreams(order, failover, Vec::new())
+    }
+
+    /// `upstreams` are the configured upstream names. They are never chosen by
+    /// the selector but count as backends in each session's allowed list.
+    pub fn with_upstreams(
+        order: BackendOrder,
+        failover: FailoverPolicy,
+        upstreams: Vec<Arc<str>>,
+    ) -> Self {
         let state = startup_state(&order, &now_rfc3339());
         Self {
             order,
+            upstreams: upstreams.into_iter().map(Backend::Upstream).collect(),
             failover,
             state: Mutex::new(state),
             sessions: Mutex::new(SessionBook::default()),
@@ -479,6 +502,26 @@ impl BackendSelector {
 
     pub fn order(&self) -> &BackendOrder {
         &self.order
+    }
+
+    /// Default allowed list of a session: the configured order, then every
+    /// upstream name. Without upstreams this is the configured order.
+    fn default_allowed(&self) -> Vec<Backend> {
+        let mut allowed = self.order.backends();
+        allowed.extend(self.upstreams.iter().cloned());
+        allowed
+    }
+
+    /// Parses a backend name from the control API: `codex`, `claude` or the
+    /// name of a configured upstream.
+    pub fn parse_backend(&self, name: &str) -> Result<Backend, String> {
+        name.parse::<Backend>().or_else(|error| {
+            self.upstreams
+                .iter()
+                .find(|upstream| upstream.as_str() == name)
+                .cloned()
+                .ok_or(error)
+        })
     }
 
     pub fn snapshot(&self) -> SelectorState {
@@ -504,7 +547,7 @@ impl BackendSelector {
             )));
         }
         let mut state = lock(&self.state);
-        let next = manual_switch(&state, &self.order, target, &now_rfc3339())
+        let next = manual_switch(&state, &self.order, target.clone(), &now_rfc3339())
             .map_err(ManualSwitchError::NotConfigured)?;
         *state = next.clone();
         Ok(next)
@@ -546,7 +589,7 @@ impl BackendSelector {
         session_id
             .and_then(|id| self.session(id))
             .map(|record| record.allowed)
-            .unwrap_or_else(|| self.order.backends())
+            .unwrap_or_else(|| self.default_allowed())
     }
 
     /// Replaces a session's allowed backends. `Ok(None)` when the session is
@@ -557,7 +600,7 @@ impl BackendSelector {
         allowed: &BackendOrder,
     ) -> Result<Option<SessionRecord>, String> {
         for backend in allowed.backends() {
-            if !self.order.contains(backend) {
+            if !self.order.contains(&backend) && !self.upstreams.contains(&backend) {
                 return Err(format!(
                     "backend \"{}\" is not in the configured order",
                     backend.as_str()
@@ -579,7 +622,7 @@ impl BackendSelector {
             .records
             .get(session_id)
             .map(|record| record.allowed.clone())
-            .unwrap_or_else(|| self.order.backends());
+            .unwrap_or_else(|| self.default_allowed());
         let record = SessionRecord {
             backend,
             since: switch.since,
@@ -623,8 +666,13 @@ fn now_rfc3339() -> String {
 /// Validates `CCP_CLAUDE_BASE_URL`. Only https is accepted, plus plain http
 /// to the loopback addresses so tests can run against a local mock.
 pub fn validate_claude_base_url(raw: &str) -> Result<Url, String> {
-    let url = Url::parse(raw)
-        .map_err(|error| format!("CCP_CLAUDE_BASE_URL is not a valid URL: {error}"))?;
+    validate_base_url(raw, "CCP_CLAUDE_BASE_URL")
+}
+
+/// The https-or-loopback rule of `validate_claude_base_url` for any
+/// Anthropic-compatible base URL. `source` names the setting in errors.
+pub fn validate_base_url(raw: &str, source: &str) -> Result<Url, String> {
+    let url = Url::parse(raw).map_err(|error| format!("{source} is not a valid URL: {error}"))?;
     let loopback = match url.host() {
         Some(Host::Ipv4(ip)) => ip == Ipv4Addr::LOCALHOST,
         Some(Host::Ipv6(ip)) => ip == Ipv6Addr::LOCALHOST,
@@ -634,36 +682,145 @@ pub fn validate_claude_base_url(raw: &str) -> Result<Url, String> {
         "https" => Ok(url),
         "http" if loopback => Ok(url),
         other => Err(format!(
-            "CCP_CLAUDE_BASE_URL must use https (http is only allowed for 127.0.0.1 or [::1]), got {other}"
+            "{source} must use https (http is only allowed for 127.0.0.1 or [::1]), got {other}"
         )),
     }
 }
 
-/// Upstream used by the Claude passthrough.
-pub struct ClaudeUpstream {
-    base_url: Url,
-    client: reqwest::Client,
+/// API key of a named upstream. Never printed: `Debug` hides it and it is only
+/// read to build the outbound auth headers.
+#[derive(Clone)]
+pub struct ApiKey(String);
+
+impl ApiKey {
+    /// Trims surrounding whitespace (key files usually end with a newline).
+    /// Refuses an empty key or one that cannot be sent as a header value. The
+    /// error never contains the key.
+    pub fn new(raw: &str) -> Result<Self, String> {
+        let key = raw.trim();
+        if key.is_empty() {
+            return Err("key is empty".to_string());
+        }
+        HeaderValue::from_str(&format!("Bearer {key}"))
+            .map_err(|_| "key contains characters not allowed in an HTTP header".to_string())?;
+        Ok(Self(key.to_string()))
+    }
 }
 
-impl ClaudeUpstream {
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ApiKey(<redacted>)")
+    }
+}
+
+enum UpstreamAuth {
+    /// Forward the client's own `authorization` / `x-api-key` (Claude).
+    Client,
+    /// Drop the client's credentials and send this key instead.
+    ApiKey(ApiKey),
+}
+
+/// An Anthropic-compatible `/v1/messages` upstream. Either api.anthropic.com
+/// for the Claude passthrough, which forwards the client's own credentials, or
+/// a named upstream from the `upstreams` config, which never sees the client's
+/// credentials and gets its configured key instead.
+pub struct AnthropicUpstream {
+    /// `claude` or the upstream name; used in logs and error messages.
+    label: Arc<str>,
+    base_url: Url,
+    client: reqwest::Client,
+    auth: UpstreamAuth,
+}
+
+/// The Claude passthrough is the `AnthropicUpstream` built by `from_base_url`.
+pub type ClaudeUpstream = AnthropicUpstream;
+
+impl AnthropicUpstream {
+    /// Claude upstream: `CCP_CLAUDE_BASE_URL` or api.anthropic.com, with the
+    /// client's credentials passed through.
     pub fn from_base_url(raw: Option<&str>) -> Result<Self, String> {
         let base_url = validate_claude_base_url(raw.unwrap_or(DEFAULT_CLAUDE_BASE_URL))?;
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(15))
-            .build()
-            .map_err(|error| format!("failed to build Claude HTTP client: {error}"))?;
-        Ok(Self { base_url, client })
+        Ok(Self {
+            label: Arc::from("claude"),
+            base_url,
+            client: build_client("Claude")?,
+            auth: UpstreamAuth::Client,
+        })
     }
 
-    /// `path` is `/v1/messages` or `/v1/messages/count_tokens`; the query string
-    /// is passed through unchanged.
-    fn endpoint_url(&self, path: &str, query: Option<&str>) -> String {
+    /// Named upstream authenticated by `key`. `base_url` must already have
+    /// passed `validate_base_url`.
+    pub fn with_api_key(name: Arc<str>, base_url: Url, key: ApiKey) -> Result<Self, String> {
+        let client = build_client(&format!("upstream \"{name}\""))?;
+        Ok(Self {
+            label: name,
+            base_url,
+            client,
+            auth: UpstreamAuth::ApiKey(key),
+        })
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub(crate) fn client(&self) -> &reqwest::Client {
+        &self.client
+    }
+
+    /// `path` is `/v1/messages`, `/v1/messages/count_tokens` or `/v1/models`;
+    /// the query string is passed through unchanged.
+    pub(crate) fn endpoint_url(&self, path: &str, query: Option<&str>) -> String {
         let base = self.base_url.as_str().trim_end_matches('/');
         match query {
             Some(query) => format!("{base}{path}?{query}"),
             None => format!("{base}{path}"),
         }
     }
+
+    /// Headers sent upstream. The Claude passthrough forwards the allowlist as
+    /// is. A named upstream gets the allowlist without the client's
+    /// `authorization` and `x-api-key`, then its own key in both headers: a
+    /// client's Claude OAuth token must never reach a third-party gateway.
+    pub fn outbound_headers(&self, inbound: &HeaderMap) -> HeaderMap {
+        let mut outbound = outbound_headers(inbound);
+        if let UpstreamAuth::ApiKey(_) = &self.auth {
+            outbound.remove(header::AUTHORIZATION);
+            outbound.remove("x-api-key");
+            outbound.extend(self.key_headers());
+        }
+        outbound
+    }
+
+    /// `authorization: Bearer <key>` and `x-api-key: <key>`, marked sensitive.
+    /// Empty for the Claude passthrough.
+    pub(crate) fn key_headers(&self) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        if let UpstreamAuth::ApiKey(ApiKey(key)) = &self.auth {
+            // `ApiKey::new` checked both values are valid header values.
+            if let (Ok(mut bearer), Ok(mut raw)) = (
+                HeaderValue::from_str(&format!("Bearer {key}")),
+                HeaderValue::from_str(key),
+            ) {
+                bearer.set_sensitive(true);
+                raw.set_sensitive(true);
+                headers.insert(header::AUTHORIZATION, bearer);
+                headers.insert(HeaderName::from_static("x-api-key"), raw);
+            }
+        }
+        headers
+    }
+
+    fn is_claude(&self) -> bool {
+        matches!(self.auth, UpstreamAuth::Client)
+    }
+}
+
+fn build_client(what: &str) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| format!("failed to build {what} HTTP client: {error}"))
 }
 
 /// Everything the server needs to route `/v1/messages`.
@@ -671,6 +828,8 @@ pub struct BackendSettings {
     pub order: BackendOrder,
     pub failover: FailoverPolicy,
     pub upstream: ClaudeUpstream,
+    /// Named Anthropic-compatible upstreams, routed by model.
+    pub upstreams: crate::upstream::Upstreams,
 }
 
 impl BackendSettings {
@@ -680,13 +839,15 @@ impl BackendSettings {
             failover: FailoverPolicy::default(),
             upstream: ClaudeUpstream::from_base_url(None)
                 .expect("default Claude upstream is valid"),
+            upstreams: crate::upstream::Upstreams::default(),
         }
     }
 }
 
 /// Reads `CCP_BACKENDS`, the `backends` key of `config.json`, the failover
 /// settings (`CCP_FAILOVER_ON_429`, `CCP_RETRY_CODEX_AFTER_SECS` or the matching
-/// config keys), and `CCP_CLAUDE_BASE_URL`. Any invalid value is an error.
+/// config keys), `CCP_CLAUDE_BASE_URL`, and the named upstreams
+/// (`CCP_UPSTREAMS_FILE` or the `upstreams` key). Any invalid value is an error.
 pub fn load_settings() -> Result<BackendSettings, String> {
     let config_dir = crate::paths::config_dir();
     let env_order = std::env::var("CCP_BACKENDS").ok();
@@ -703,10 +864,15 @@ pub fn load_settings() -> Result<BackendSettings, String> {
     )?;
     let upstream =
         ClaudeUpstream::from_base_url(std::env::var("CCP_CLAUDE_BASE_URL").ok().as_deref())?;
+    let upstreams = crate::upstream::load(
+        std::env::var_os("CCP_UPSTREAMS_FILE").as_deref(),
+        crate::config::file_upstreams_in(&config_dir).as_ref(),
+    )?;
     Ok(BackendSettings {
         order,
         failover,
         upstream,
+        upstreams,
     })
 }
 
@@ -736,6 +902,8 @@ pub fn outbound_headers(inbound: &HeaderMap) -> HeaderMap {
 struct PassthroughSummary {
     log: Logger,
     req_id: String,
+    backend: Arc<str>,
+    claude: bool,
     model: Option<String>,
     status: StatusCode,
     started_at: Instant,
@@ -745,10 +913,14 @@ struct PassthroughSummary {
 impl Drop for PassthroughSummary {
     fn drop(&mut self) {
         self.log.info(
-            "claude passthrough completed",
+            if self.claude {
+                "claude passthrough completed"
+            } else {
+                "upstream passthrough completed"
+            },
             Some(Map::from_iter([
                 ("reqId".to_string(), json!(&self.req_id)),
-                ("backend".to_string(), json!("claude")),
+                ("backend".to_string(), json!(&*self.backend)),
                 ("model".to_string(), json!(&self.model)),
                 ("status".to_string(), json!(self.status.as_u16())),
                 (
@@ -759,6 +931,21 @@ impl Drop for PassthroughSummary {
             ])),
         );
     }
+}
+
+/// One request forwarded to an Anthropic-compatible upstream.
+pub struct ForwardRequest<'a> {
+    pub req_id: &'a str,
+    /// Model sent upstream, for the completion log line.
+    pub model: Option<&'a str>,
+    pub headers: &'a HeaderMap,
+    pub query: Option<&'a str>,
+    pub body: Bytes,
+    /// Model id the client asked for, when it differs from the one sent
+    /// upstream (a `<upstream>/` prefix was stripped). A successful response
+    /// gets it back in the JSON `model` field, or in `message.model` of the
+    /// streamed `message_start` event; nothing else is changed.
+    pub restore_model: Option<String>,
 }
 
 /// Sends the original `/v1/messages` request bytes to Anthropic and streams the
@@ -783,7 +970,19 @@ pub async fn forward_messages(
     query: Option<&str>,
     body: Bytes,
 ) -> Response {
-    forward_passthrough(upstream, MESSAGES_PATH, req_id, model, headers, query, body).await
+    forward(
+        upstream,
+        false,
+        ForwardRequest {
+            req_id,
+            model,
+            headers,
+            query,
+            body,
+            restore_model: None,
+        },
+    )
+    .await
 }
 
 /// Same passthrough as `forward_messages`, to `/v1/messages/count_tokens`.
@@ -795,28 +994,35 @@ pub async fn forward_count_tokens(
     query: Option<&str>,
     body: Bytes,
 ) -> Response {
-    forward_passthrough(
+    forward(
         upstream,
-        COUNT_TOKENS_PATH,
-        req_id,
-        model,
-        headers,
-        query,
-        body,
+        true,
+        ForwardRequest {
+            req_id,
+            model,
+            headers,
+            query,
+            body,
+            restore_model: None,
+        },
     )
     .await
 }
 
-async fn forward_passthrough(
-    upstream: &ClaudeUpstream,
-    path: &str,
-    req_id: &str,
-    model: Option<&str>,
-    headers: &HeaderMap,
-    query: Option<&str>,
-    body: Bytes,
+/// Forwards to `/v1/messages` or, with `count_tokens`, to
+/// `/v1/messages/count_tokens` of any Anthropic-compatible upstream, streaming
+/// the response back as it arrives.
+pub async fn forward(
+    upstream: &AnthropicUpstream,
+    count_tokens: bool,
+    request: ForwardRequest<'_>,
 ) -> Response {
-    if !has_passthrough_credentials(headers) {
+    let path = if count_tokens {
+        COUNT_TOKENS_PATH
+    } else {
+        MESSAGES_PATH
+    };
+    if upstream.is_claude() && !has_passthrough_credentials(request.headers) {
         return json_error(
             StatusCode::UNAUTHORIZED,
             "authentication_error",
@@ -826,26 +1032,32 @@ async fn forward_passthrough(
     let started_at = Instant::now();
     let sent = upstream
         .client
-        .post(upstream.endpoint_url(path, query))
-        .headers(outbound_headers(headers))
-        .body(body)
+        .post(upstream.endpoint_url(path, request.query))
+        .headers(upstream.outbound_headers(request.headers))
+        .body(request.body)
         .send()
         .await;
     let upstream_response = match sent {
         Ok(response) => response,
         Err(error) => {
             create_logger("backend").warn(
-                "claude passthrough failed",
+                if upstream.is_claude() {
+                    "claude passthrough failed"
+                } else {
+                    "upstream passthrough failed"
+                },
                 Some(Map::from_iter([
-                    ("reqId".to_string(), json!(req_id)),
+                    ("reqId".to_string(), json!(request.req_id)),
+                    ("backend".to_string(), json!(upstream.label())),
                     ("error".to_string(), json!(error.to_string())),
                 ])),
             );
-            return json_error(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                "Claude upstream request failed",
-            );
+            let message = if upstream.is_claude() {
+                "Claude upstream request failed".to_string()
+            } else {
+                format!("Upstream \"{}\" request failed", upstream.label())
+            };
+            return json_error(StatusCode::BAD_GATEWAY, "api_error", message);
         }
     };
     let status = upstream_response.status();
@@ -853,25 +1065,59 @@ async fn forward_passthrough(
         .headers()
         .get(header::CONTENT_TYPE)
         .cloned();
-    let summary = PassthroughSummary {
+    let mut summary = PassthroughSummary {
         log: create_logger("backend"),
-        req_id: req_id.to_string(),
-        model: model.map(str::to_string),
+        req_id: request.req_id.to_string(),
+        backend: upstream.label.clone(),
+        claude: upstream.is_claude(),
+        model: request.model.map(str::to_string),
         status,
         started_at,
         bytes: 0,
     };
-    let chunks = futures_util::stream::unfold(
-        (upstream_response.bytes_stream(), summary),
-        |(mut chunks, mut summary)| async move {
-            let chunk = chunks.next().await?;
-            if let Ok(bytes) = &chunk {
-                summary.bytes += bytes.len() as u64;
+    let media_type = content_type
+        .as_ref()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|raw| raw.split(';').next())
+        .map(|media_type| media_type.trim().to_ascii_lowercase());
+    let restore_model = request.restore_model.filter(|_| status.is_success());
+    let mut rewriter = None;
+    let body = match (restore_model, media_type.as_deref()) {
+        (Some(model), Some("application/json")) => {
+            // A non-streamed answer is one JSON document: read it whole.
+            let bytes = match upstream_response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    create_logger("backend").warn(
+                        "upstream response read failed",
+                        Some(Map::from_iter([
+                            ("reqId".to_string(), json!(request.req_id)),
+                            ("backend".to_string(), json!(upstream.label())),
+                            ("error".to_string(), json!(error.to_string())),
+                        ])),
+                    );
+                    return json_error(
+                        StatusCode::BAD_GATEWAY,
+                        "api_error",
+                        format!("Upstream \"{}\" response failed", upstream.label()),
+                    );
+                }
+            };
+            summary.bytes = bytes.len() as u64;
+            Body::from(crate::upstream::restore_model_in_json(&bytes, &model).unwrap_or(bytes))
+        }
+        (restore_model, media_type) => {
+            if media_type == Some("text/event-stream") {
+                rewriter = restore_model.map(crate::upstream::SseModelRewriter::new);
             }
-            Some((chunk, (chunks, summary)))
-        },
-    );
-    let mut response = Response::new(Body::from_stream(chunks));
+            Body::from_stream(stream_body(
+                upstream_response.bytes_stream(),
+                summary,
+                rewriter,
+            ))
+        }
+    };
+    let mut response = Response::new(body);
     *response.status_mut() = status;
     if let Some(content_type) = content_type {
         response
@@ -879,6 +1125,55 @@ async fn forward_passthrough(
             .insert(header::CONTENT_TYPE, content_type);
     }
     response
+}
+
+/// Streams the upstream body through, counting bytes for the summary line.
+/// With a rewriter, each chunk goes through it so `message_start` carries the
+/// requested model; every other byte passes through as soon as its event ends.
+fn stream_body<S>(
+    chunks: S,
+    summary: PassthroughSummary,
+    rewriter: Option<crate::upstream::SseModelRewriter>,
+) -> impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>>
+where
+    S: futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+{
+    futures_util::stream::unfold(
+        (chunks, summary, rewriter, false),
+        |(mut chunks, mut summary, mut rewriter, ended)| async move {
+            if ended {
+                return None;
+            }
+            loop {
+                match chunks.next().await {
+                    Some(Ok(bytes)) => {
+                        summary.bytes += bytes.len() as u64;
+                        let out = match rewriter.as_mut() {
+                            Some(rewriter) => Bytes::from(rewriter.push(&bytes)),
+                            None => bytes,
+                        };
+                        if out.is_empty() {
+                            continue;
+                        }
+                        return Some((Ok(out), (chunks, summary, rewriter, false)));
+                    }
+                    Some(Err(error)) => {
+                        return Some((Err(error), (chunks, summary, rewriter, false)));
+                    }
+                    None => {
+                        let rest = rewriter
+                            .as_mut()
+                            .map(crate::upstream::SseModelRewriter::finish)
+                            .unwrap_or_default();
+                        if rest.is_empty() {
+                            return None;
+                        }
+                        return Some((Ok(Bytes::from(rest)), (chunks, summary, rewriter, true)));
+                    }
+                }
+            }
+        },
+    )
 }
 
 fn no_store(mut response: Response) -> Response {
@@ -989,7 +1284,7 @@ async fn post_backend(
             ));
         }
     };
-    match selector.switch_manual(target) {
+    match selector.switch_manual(target.clone()) {
         Ok(state) => {
             create_logger("backend").info(
                 "backend switched",
@@ -1100,7 +1395,7 @@ async fn post_session_allowed(
         let Some(name) = name.as_str() else {
             return bad_body();
         };
-        match name.parse::<Backend>() {
+        match selector.parse_backend(name) {
             Ok(backend) => backends.push(backend),
             Err(message) => {
                 return no_store(json_error(

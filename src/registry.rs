@@ -59,6 +59,9 @@ pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "kimi-
 pub(crate) const GROK_MODELS: &[&str] =
     &["grok-composer-2.5-fast", "grok-4.5", "grok-4.6", "grok-4.7"];
 
+/// Providers `Registry::new` builds. Named upstreams may not take these names.
+pub const BUILTIN_PROVIDERS: &[&str] = &["codex", "cursor", "grok", "kimi", "opencode"];
+
 pub struct Registry {
     alias_provider: AliasProvider,
     models: BTreeMap<String, Vec<String>>,
@@ -347,6 +350,14 @@ fn build_cursor_models() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_provider_names_match_the_registry() {
+        assert_eq!(
+            Registry::new(AliasProvider::Codex).list_provider_names(),
+            BUILTIN_PROVIDERS
+        );
+    }
 
     #[test]
     fn normalize_model_trims_hint() {

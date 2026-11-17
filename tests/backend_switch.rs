@@ -119,6 +119,7 @@ fn app_with_failover(
         order: BackendOrder::new(order).unwrap(),
         failover,
         upstream: ClaudeUpstream::from_base_url(claude_base).unwrap(),
+        upstreams: Default::default(),
     };
     app_with_backend_settings(registry, None, AppFeatures::default(), settings)
 }
