@@ -879,6 +879,17 @@ pub fn load_settings() -> Result<BackendSettings, String> {
 /// Claude passthrough needs the caller's own credentials, either an
 /// `authorization` or an `x-api-key` header. The proxy never supplies a token
 /// of its own.
+/// Whether `model` names a Claude model: a `claude-*` id or one of Claude
+/// Code's short aliases, with an optional `[1m]` suffix. Only these follow the
+/// global backend; every other model goes to the provider that serves it, so a
+/// `gpt-*` request never reaches Anthropic because Claude happens to be current.
+pub fn is_claude_model(model: &str) -> bool {
+    let model = crate::registry::normalize_incoming_model(model).to_ascii_lowercase();
+    model.starts_with("claude-")
+        || matches!(model.as_str(), "opus" | "sonnet" | "haiku" | "fable")
+        || crate::registry::is_anthropic_alias(&model)
+}
+
 pub fn has_passthrough_credentials(headers: &HeaderMap) -> bool {
     headers.contains_key(header::AUTHORIZATION) || headers.contains_key("x-api-key")
 }

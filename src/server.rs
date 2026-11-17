@@ -1703,14 +1703,17 @@ async fn dispatch_request(
         .await;
     }
     let current_backend = state.backends.snapshot().current;
-    // Messages follow the global backend. A count_tokens request also goes to
-    // Claude when the session may use only Claude, since counting never reaches
-    // a generation backend.
-    let claude_route = if count_tokens {
-        current_backend == Backend::Claude || !session_allowed.contains(&Backend::Codex)
-    } else {
-        current_backend == Backend::Claude
-    };
+    // Only Claude models follow the global backend; any other model (gpt-*,
+    // kimi, grok, ...) stays on the provider that serves it. A count_tokens
+    // request for a Claude model also goes to Claude when the session may use
+    // only Claude, since counting never reaches a generation backend.
+    let claude_model = body.model.as_deref().is_some_and(backend::is_claude_model);
+    let claude_route = claude_model
+        && if count_tokens {
+            current_backend == Backend::Claude || !session_allowed.contains(&Backend::Codex)
+        } else {
+            current_backend == Backend::Claude
+        };
     if claude_route {
         if !session_allowed.contains(&Backend::Claude) {
             let model = body.model.as_deref().unwrap_or("(none)");
@@ -2097,7 +2100,10 @@ async fn dispatch_request(
             started_at,
         },
     );
+    // Only a Claude model can fail over to Claude: Anthropic does not serve
+    // gpt-* or any other provider's model.
     if !count_tokens
+        && claude_model
         && response.status() == StatusCode::TOO_MANY_REQUESTS
         && backend::has_passthrough_credentials(&headers)
     {

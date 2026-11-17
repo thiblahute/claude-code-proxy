@@ -23,7 +23,7 @@ use tower::util::ServiceExt;
 
 const LOCAL: &str = "127.0.0.1:50000";
 const REMOTE: &str = "203.0.113.7:50000";
-const MESSAGES_BODY: &str = r#"{ "model":"gpt-5.5",  "max_tokens": 16, "stream": true,
+const MESSAGES_BODY: &str = r#"{ "model":"claude-opus-4-1",  "max_tokens": 16, "stream": true,
   "messages": [{"role":"user","content":"hi"}] }"#;
 
 struct NoCli;
@@ -461,7 +461,7 @@ async fn claude_passthrough_forwards_body_bytes_and_allowed_headers() {
         .unwrap();
     let session = body_json(session).await;
     assert_eq!(session["backend"], "claude");
-    assert_eq!(session["model"], "gpt-5.5");
+    assert_eq!(session["model"], "claude-opus-4-1");
 }
 
 #[tokio::test]
@@ -1161,4 +1161,70 @@ async fn claude_passthrough_returns_rate_limit_headers_verbatim() {
     );
     assert!(headers.get(header::SET_COOKIE).is_none());
     assert!(body_text(response).await.contains("rate_limit_error"));
+}
+
+fn gpt_request(extra: &[(&str, &str)]) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/messages?beta=true")
+        .header(header::CONTENT_TYPE, "application/json");
+    for (name, value) in extra {
+        builder = builder.header(*name, *value);
+    }
+    builder
+        .body(Body::from(
+            r#"{"model":"gpt-5.5","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+        ))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn non_claude_model_stays_on_its_provider_while_claude_is_current() {
+    let (base, recorded) = start_mock().await;
+    let router = app(
+        vec![Backend::Claude, Backend::Codex],
+        StatusCode::OK,
+        Some(&base),
+    );
+
+    let response = router
+        .oneshot(gpt_request(&[("authorization", "Bearer test-token")]))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        recorded.lock().unwrap().is_empty(),
+        "a gpt-* request must never reach Anthropic"
+    );
+}
+
+#[tokio::test]
+async fn non_claude_model_429_does_not_fail_over_to_claude() {
+    let (base, recorded) = start_mock().await;
+    let router = app(
+        vec![Backend::Codex, Backend::Claude],
+        StatusCode::TOO_MANY_REQUESTS,
+        Some(&base),
+    );
+
+    let response = router
+        .clone()
+        .oneshot(gpt_request(&[("authorization", "Bearer test-token")]))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(recorded.lock().unwrap().is_empty());
+    let state = body_json(
+        router
+            .oneshot(control(Method::GET, "/control/backend", "", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        state["current"], "codex",
+        "a gpt-* 429 must not switch the backend"
+    );
 }
